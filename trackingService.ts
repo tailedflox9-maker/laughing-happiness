@@ -1,5 +1,5 @@
-// trackingService.ts - IMPROVED VERSION
-import { supabase } from './supabaseClient';
+// trackingService.ts - UPDATED to use separate analytics client
+import { analyticsClient, isAnalyticsEnabled, safeAnalyticsOperation } from './analyticsClient';
 
 // ============================================
 // Types
@@ -77,19 +77,19 @@ const FLUSH_INTERVAL = 5000; // Flush every 5 seconds
 const MAX_QUEUE_SIZE = 10; // Or when queue reaches 10 events
 
 const flushEvents = async () => {
-  if (eventQueue.length === 0) return;
+  if (eventQueue.length === 0 || !isAnalyticsEnabled) return;
   
   const eventsToSend = [...eventQueue];
   eventQueue = [];
   
-  try {
+  await safeAnalyticsOperation(async () => {
     // Group events by table
     const businessInteractions = eventsToSend.filter(e => e.table === 'business_interactions');
     const visitLogs = eventsToSend.filter(e => e.table === 'visit_logs');
     
     // Batch insert business interactions
-    if (businessInteractions.length > 0) {
-      const { error } = await supabase
+    if (businessInteractions.length > 0 && analyticsClient) {
+      const { error } = await analyticsClient
         .from('business_interactions')
         .insert(businessInteractions.map(e => e.data));
       
@@ -97,19 +97,14 @@ const flushEvents = async () => {
     }
     
     // Batch insert visit logs
-    if (visitLogs.length > 0) {
-      const { error } = await supabase
+    if (visitLogs.length > 0 && analyticsClient) {
+      const { error } = await analyticsClient
         .from('visit_logs')
         .insert(visitLogs.map(e => e.data));
       
       if (error) console.error('Error inserting visit logs:', error);
     }
-    
-  } catch (error) {
-    console.error('Error flushing events:', error);
-    // Put failed events back in queue
-    eventQueue = [...eventsToSend, ...eventQueue];
-  }
+  }, undefined);
 };
 
 const scheduleFlush = () => {
@@ -118,6 +113,8 @@ const scheduleFlush = () => {
 };
 
 const queueEvent = (table: string, data: any) => {
+  if (!isAnalyticsEnabled) return; // Skip if analytics disabled
+  
   eventQueue.push({ table, data });
   
   // Flush immediately if queue is full
@@ -147,8 +144,10 @@ export const trackBusinessInteraction = (
 
 // Get popular businesses
 export const getPopularBusinesses = async (limit: number = 10) => {
-  try {
-    const { data, error } = await supabase
+  return safeAnalyticsOperation(async () => {
+    if (!analyticsClient) return [];
+    
+    const { data, error } = await analyticsClient
       .from('business_interactions')
       .select('business_id, event_type')
       .order('created_at', { ascending: false });
@@ -176,10 +175,7 @@ export const getPopularBusinesses = async (limit: number = 10) => {
       .slice(0, limit);
     
     return sorted;
-  } catch (error) {
-    console.error('Error fetching popular businesses:', error);
-    return [];
-  }
+  }, []);
 };
 
 // ============================================
@@ -209,6 +205,8 @@ document.addEventListener('visibilitychange', () => {
 });
 
 export const startLiveTracking = async () => {
+  if (!isAnalyticsEnabled) return; // Skip if analytics disabled
+  
   const deviceId = getDeviceId();
   const userName = getUserName();
   
@@ -226,15 +224,17 @@ export const startLiveTracking = async () => {
   window.addEventListener('beforeunload', () => {
     if (pingInterval) clearInterval(pingInterval);
     // Send final ping with is_active = false
-    navigator.sendBeacon(
-      `${supabase.supabaseUrl}/rest/v1/live_users`,
-      JSON.stringify({
-        device_id: deviceId,
-        user_name: userName,
-        is_active: false,
-        last_ping: new Date().toISOString()
-      })
-    );
+    if (isAnalyticsEnabled && analyticsClient) {
+      navigator.sendBeacon(
+        `${analyticsClient.supabaseUrl}/rest/v1/live_users`,
+        JSON.stringify({
+          device_id: deviceId,
+          user_name: userName,
+          is_active: false,
+          last_ping: new Date().toISOString()
+        })
+      );
+    }
   });
 };
 
@@ -242,12 +242,15 @@ const sendPing = async (deviceId: string, userName: string | null) => {
   // Only ping if:
   // 1. Tab is visible
   // 2. User was active in last 10 seconds
-  if (!isTabActive || Date.now() - lastActivity > MIN_ACTIVITY_GAP) {
+  // 3. Analytics is enabled
+  if (!isTabActive || Date.now() - lastActivity > MIN_ACTIVITY_GAP || !isAnalyticsEnabled) {
     return; // Skip ping
   }
   
-  try {
-    const { error } = await supabase
+  await safeAnalyticsOperation(async () => {
+    if (!analyticsClient) return;
+    
+    const { error } = await analyticsClient
       .from('live_users')
       .upsert({
         device_id: deviceId,
@@ -259,16 +262,16 @@ const sendPing = async (deviceId: string, userName: string | null) => {
       });
     
     if (error) console.error('Error sending ping:', error);
-  } catch (error) {
-    console.error('Error in sendPing:', error);
-  }
+  }, undefined);
 };
 
 export const getLiveUsersCount = async (): Promise<number> => {
-  try {
+  return safeAnalyticsOperation(async () => {
+    if (!analyticsClient) return 0;
+    
     const threshold = new Date(Date.now() - ACTIVE_THRESHOLD).toISOString();
     
-    const { count, error } = await supabase
+    const { count, error } = await analyticsClient
       .from('live_users')
       .select('*', { count: 'exact', head: true })
       .eq('is_active', true)
@@ -276,10 +279,7 @@ export const getLiveUsersCount = async (): Promise<number> => {
     
     if (error) throw error;
     return count || 0;
-  } catch (error) {
-    console.error('Error fetching live users:', error);
-    return 0;
-  }
+  }, 0);
 };
 
 // ============================================
@@ -287,10 +287,12 @@ export const getLiveUsersCount = async (): Promise<number> => {
 // ============================================
 
 export const getHourlyStats = async (date?: string) => {
-  try {
+  return safeAnalyticsOperation(async () => {
+    if (!analyticsClient) return [];
+    
     const targetDate = date || new Date().toISOString().split('T')[0];
     
-    const { data, error } = await supabase
+    const { data, error } = await analyticsClient
       .from('visit_logs')
       .select('visited_at')
       .gte('visited_at', `${targetDate}T00:00:00`)
@@ -311,18 +313,17 @@ export const getHourlyStats = async (date?: string) => {
       hour: parseInt(hour),
       visits: count
     }));
-  } catch (error) {
-    console.error('Error fetching hourly stats:', error);
-    return [];
-  }
+  }, []);
 };
 
 export const getDailyStats = async (days: number = 7) => {
-  try {
+  return safeAnalyticsOperation(async () => {
+    if (!analyticsClient) return [];
+    
     const startDate = new Date();
     startDate.setDate(startDate.getDate() - days);
     
-    const { data, error } = await supabase
+    const { data, error } = await analyticsClient
       .from('visit_logs')
       .select('visited_at')
       .gte('visited_at', startDate.toISOString());
@@ -340,10 +341,7 @@ export const getDailyStats = async (days: number = 7) => {
     return Object.entries(dailyData)
       .map(([date, count]) => ({ date, visits: count }))
       .sort((a, b) => a.date.localeCompare(b.date));
-  } catch (error) {
-    console.error('Error fetching daily stats:', error);
-    return [];
-  }
+  }, []);
 };
 
 // ============================================
@@ -351,12 +349,20 @@ export const getDailyStats = async (days: number = 7) => {
 // ============================================
 
 export const trackUserVisit = async (userName: string): Promise<void> => {
-  try {
+  if (!isAnalyticsEnabled) {
+    // Still save name locally even if analytics disabled
+    setUserName(userName);
+    return;
+  }
+  
+  await safeAnalyticsOperation(async () => {
+    if (!analyticsClient) return;
+    
     const deviceId = getDeviceId();
     const userAgent = navigator.userAgent;
     
     // Check if user already exists
-    const { data: existingUser, error: fetchError } = await supabase
+    const { data: existingUser, error: fetchError } = await analyticsClient
       .from('user_tracking')
       .select('*')
       .eq('device_id', deviceId)
@@ -368,7 +374,7 @@ export const trackUserVisit = async (userName: string): Promise<void> => {
     
     if (existingUser) {
       // Update existing user
-      const { error: updateError } = await supabase
+      const { error: updateError } = await analyticsClient
         .from('user_tracking')
         .update({
           user_name: userName,
@@ -382,7 +388,7 @@ export const trackUserVisit = async (userName: string): Promise<void> => {
       }
     } else {
       // Create new user
-      const { error: insertError } = await supabase
+      const { error: insertError } = await analyticsClient
         .from('user_tracking')
         .insert([{
           user_name: userName,
@@ -410,15 +416,14 @@ export const trackUserVisit = async (userName: string): Promise<void> => {
     
     // Start live tracking
     startLiveTracking();
-    
-  } catch (error) {
-    console.error('Error tracking user visit:', error);
-  }
+  }, undefined);
 };
 
 export const getAnalyticsSummary = async (): Promise<AnalyticsSummary | null> => {
-  try {
-    const { data, error } = await supabase
+  return safeAnalyticsOperation(async () => {
+    if (!analyticsClient) return null;
+    
+    const { data, error } = await analyticsClient
       .from('analytics_summary')
       .select('*')
       .eq('id', 1)
@@ -430,15 +435,14 @@ export const getAnalyticsSummary = async (): Promise<AnalyticsSummary | null> =>
     }
     
     return data;
-  } catch (error) {
-    console.error('Error in getAnalyticsSummary:', error);
-    return null;
-  }
+  }, null);
 };
 
 export const getAllUsers = async (): Promise<UserTrackingData[]> => {
-  try {
-    const { data, error } = await supabase
+  return safeAnalyticsOperation(async () => {
+    if (!analyticsClient) return [];
+    
+    const { data, error } = await analyticsClient
       .from('user_tracking')
       .select('*')
       .order('last_visit_at', { ascending: false });
@@ -449,15 +453,14 @@ export const getAllUsers = async (): Promise<UserTrackingData[]> => {
     }
     
     return data || [];
-  } catch (error) {
-    console.error('Error in getAllUsers:', error);
-    return [];
-  }
+  }, []);
 };
 
 export const getRecentVisits = async (limit: number = 50): Promise<VisitLog[]> => {
-  try {
-    const { data, error } = await supabase
+  return safeAnalyticsOperation(async () => {
+    if (!analyticsClient) return [];
+    
+    const { data, error } = await analyticsClient
       .from('visit_logs')
       .select('*')
       .order('visited_at', { ascending: false })
@@ -469,14 +472,15 @@ export const getRecentVisits = async (limit: number = 50): Promise<VisitLog[]> =
     }
     
     return data || [];
-  } catch (error) {
-    console.error('Error in getRecentVisits:', error);
-    return [];
-  }
+  }, []);
 };
 
 export const initializeTracking = async (): Promise<void> => {
-  try {
+  if (!isAnalyticsEnabled) return;
+  
+  await safeAnalyticsOperation(async () => {
+    if (!analyticsClient) return;
+    
     const deviceId = getDeviceId();
     const userName = getUserName();
     
@@ -491,7 +495,7 @@ export const initializeTracking = async (): Promise<void> => {
       });
       
       // Update last visit time (no need to increment, trigger will handle it)
-      await supabase
+      await analyticsClient
         .from('user_tracking')
         .update({
           last_visit_at: new Date().toISOString()
@@ -501,10 +505,7 @@ export const initializeTracking = async (): Promise<void> => {
       // Start live tracking
       startLiveTracking();
     }
-    
-  } catch (error) {
-    console.error('Error initializing tracking:', error);
-  }
+  }, undefined);
 };
 
 // Clean up on page unload
